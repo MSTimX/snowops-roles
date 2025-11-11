@@ -35,8 +35,14 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
+	authMode := os.Getenv("AUTH_MODE")
+
 	api := router.Group("/api/v1")
-	api.Use(middleware.MockAuthMiddleware())
+	if strings.ToLower(authMode) == "jwt" {
+		api.Use(middleware.JWTAuthMiddleware())
+	} else {
+		api.Use(middleware.MockAuthMiddleware())
+	}
 	handlers.RegisterRoutes(api)
 
 	log.Printf("starting server on port %s", port)

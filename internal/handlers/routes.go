@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -39,6 +40,7 @@ func RegisterRoutes(api *gin.RouterGroup) {
 	api.PUT("/organizations/:id", UpdateOrganization)
 	api.DELETE("/organizations/:id", DeleteOrganization)
 
+	api.GET("/users", FindUser)
 	api.GET("/users/:id", GetUser)
 	api.PUT("/users/:id", UpdateUser)
 
@@ -322,6 +324,42 @@ func UpdateOrganization(c *gin.Context) {
 
 func DeleteOrganization(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "not implemented yet"})
+}
+
+func FindUser(c *gin.Context) {
+	phone := c.Query("phone")
+	login := c.Query("login")
+
+	if phone == "" && login == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "phone or login required"})
+		return
+	}
+
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	var user models.User
+	q := database.DB.Model(&models.User{}).Where("is_active = ?", true)
+
+	if phone != "" {
+		q = q.Where("phone = ?", phone)
+	}
+	if login != "" {
+		q = q.Where("login = ?", login)
+	}
+
+	if err := q.First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"user": user})
 }
 
 func GetUser(c *gin.Context) {
