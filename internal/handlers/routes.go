@@ -44,11 +44,12 @@ func RegisterRoutes(api *gin.RouterGroup) {
 	api.GET("/users/:id", GetUser)
 	api.PUT("/users/:id", UpdateUser)
 
-	api.GET("/drivers", ListDrivers)
-	api.POST("/drivers", CreateDriver)
-	api.GET("/drivers/:id", GetDriver)
-	api.PUT("/drivers/:id", UpdateDriver)
-	api.DELETE("/drivers/:id", DeleteDriver)
+	drivers := api.Group("/drivers")
+	drivers.GET("", ListDrivers)
+	drivers.POST("", CreateDriver)
+	drivers.GET("/:id", GetDriver)
+	drivers.PUT("/:id", UpdateDriver)
+	drivers.DELETE("/:id", DeleteDriver)
 }
 
 func ListOrganizations(c *gin.Context) {
@@ -323,7 +324,109 @@ func UpdateOrganization(c *gin.Context) {
 }
 
 func DeleteOrganization(c *gin.Context) {
-	c.JSON(200, gin.H{"message": "not implemented yet"})
+	role := c.GetString("currentUserRole")
+	currentOrgID := c.GetString("currentOrgID")
+
+	if role == "" || currentOrgID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	currentOrgUUID, err := uuid.Parse(currentOrgID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid current organization id"})
+		return
+	}
+
+	targetID := c.Param("id")
+	orgUUID, err := uuid.Parse(targetID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid organization id"})
+		return
+	}
+
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	var org models.Organization
+	if err := database.DB.Where("id = ? AND is_active = ?", orgUUID, true).First(&org).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "organization not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch organization"})
+		}
+		return
+	}
+
+	switch role {
+	case models.RoleAkimatAdmin:
+	case models.RoleTooAdmin:
+		if org.ID != currentOrgUUID {
+			if org.Type != models.OrgTypeContractor || org.ParentOrgID == nil || *org.ParentOrgID != currentOrgUUID {
+				c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+				return
+			}
+		}
+	case models.RoleContractorAdmin:
+		if org.ID != currentOrgUUID {
+			c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+			return
+		}
+	default:
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	tx := database.DB.Begin()
+	if tx.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start transaction"})
+		return
+	}
+
+	if err := tx.Model(&org).Update("is_active", false).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate organization"})
+		return
+	}
+
+	if err := tx.Model(&models.User{}).Where("organization_id = ?", org.ID).Update("is_active", false).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate organization users"})
+		return
+	}
+
+	if org.Type == models.OrgTypeContractor {
+		if err := tx.Model(&models.Driver{}).Where("contractor_id = ?", org.ID).Update("is_active", false).Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate drivers"})
+			return
+		}
+
+		var driverIDs []uuid.UUID
+		if err := tx.Model(&models.Driver{}).Where("contractor_id = ?", org.ID).Pluck("id", &driverIDs).Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch driver ids"})
+			return
+		}
+
+		if len(driverIDs) > 0 {
+			if err := tx.Model(&models.User{}).Where("driver_id IN ?", driverIDs).Update("is_active", false).Error; err != nil {
+				tx.Rollback()
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to deactivate driver users"})
+				return
+			}
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to finalize organization deletion"})
+		return
+	}
+
+	c.Status(http.StatusNoContent)
 }
 
 func FindUser(c *gin.Context) {
@@ -470,13 +573,148 @@ func CreateDriver(c *gin.Context) {
 }
 
 func GetDriver(c *gin.Context) {
-	c.JSON(200, gin.H{"message": "not implemented yet"})
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+
+	var driver models.Driver
+	if err := database.DB.Where("id = ? AND is_active = ?", id, true).First(&driver).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "driver not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
+		}
+		return
+	}
+
+	role := c.GetString("currentUserRole")
+	orgID := c.GetString("currentOrgID")
+
+	contractorOrgID := ""
+	if driver.ContractorID != nil {
+		contractorOrgID = driver.ContractorID.String()
+	}
+
+	if !CanAccessDriver(role, orgID, contractorOrgID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"driver": driver})
 }
 
 func UpdateDriver(c *gin.Context) {
-	c.JSON(200, gin.H{"message": "not implemented yet"})
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+
+	var driver models.Driver
+	if err := database.DB.Where("id = ?", id).First(&driver).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "driver not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
+		}
+		return
+	}
+
+	role := c.GetString("currentUserRole")
+	orgID := c.GetString("currentOrgID")
+
+	contractorOrgID := ""
+	if driver.ContractorID != nil {
+		contractorOrgID = driver.ContractorID.String()
+	}
+
+	if !CanAccessDriver(role, orgID, contractorOrgID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+		return
+	}
+
+	var body struct {
+		FullName  *string `json:"full_name"`
+		Phone     *string `json:"phone"`
+		BirthYear *int    `json:"birth_year"`
+		IIN       *string `json:"iin"`
+	}
+
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	if err := database.DB.Model(&driver).Updates(body).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db update failed"})
+		return
+	}
+
+	if err := database.DB.Where("id = ?", id).First(&driver).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"driver": driver})
 }
 
 func DeleteDriver(c *gin.Context) {
-	c.JSON(200, gin.H{"message": "not implemented yet"})
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+
+	var driver models.Driver
+	if err := database.DB.Where("id = ?", id).First(&driver).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "driver not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db query failed"})
+		}
+		return
+	}
+
+	role := c.GetString("currentUserRole")
+	orgID := c.GetString("currentOrgID")
+
+	contractorOrgID := ""
+	if driver.ContractorID != nil {
+		contractorOrgID = driver.ContractorID.String()
+	}
+
+	if !CanAccessDriver(role, orgID, contractorOrgID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+		return
+	}
+
+	if err := database.DB.Model(&driver).Update("is_active", false).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db update failed"})
+		return
+	}
+
+	if err := database.DB.Model(&models.User{}).Where("driver_id = ?", driver.ID).Update("is_active", false).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db update failed"})
+		return
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+func CanAccessDriver(role, currentOrgID, contractorOrgID string) bool {
+	if role == "AKIMAT_ADMIN" {
+		return true
+	}
+	if role == "TOO_ADMIN" && contractorOrgID != "" {
+		return true
+	}
+	if role == "CONTRACTOR_ADMIN" && currentOrgID == contractorOrgID {
+		return true
+	}
+	return false
 }
